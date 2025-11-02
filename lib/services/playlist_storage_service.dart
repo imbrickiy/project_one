@@ -1,11 +1,13 @@
 import 'dart:io';
 import 'dart:convert';
 import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import '../models/iptv_channel.dart';
 
 class PlaylistStorageService {
   static const String _playlistFileName = 'saved_playlist.m3u8';
   static const String _channelsFileName = 'saved_channels.json';
+  static const String _playlistUrlKey = 'saved_playlist_url';
 
   /// Получает директорию для сохранения файлов приложения
   Future<Directory> _getAppDirectory() async {
@@ -14,7 +16,7 @@ class PlaylistStorageService {
   }
 
   /// Сохраняет плейлист в файл m3u8
-  Future<void> savePlaylist(List<IptvChannel> channels) async {
+  Future<void> savePlaylist(List<IptvChannel> channels, {String? playlistUrl}) async {
     try {
       final appDir = await _getAppDirectory();
       final playlistFile = File('${appDir.path}/$_playlistFileName');
@@ -52,6 +54,12 @@ class PlaylistStorageService {
       
       // Также сохраняем в JSON для быстрой загрузки
       await saveChannelsJson(channels);
+      
+      // Сохраняем URL плейлиста, если он был указан
+      if (playlistUrl != null && playlistUrl.isNotEmpty) {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString(_playlistUrlKey, playlistUrl);
+      }
     } catch (e) {
       throw Exception('Ошибка сохранения плейлиста: $e');
     }
@@ -222,8 +230,22 @@ final line = lines[i].trim();
       if (await jsonFile.exists()) {
         await jsonFile.delete();
       }
+      
+      // Удаляем сохраненный URL плейлиста
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_playlistUrlKey);
     } catch (e) {
       throw Exception('Ошибка удаления плейлиста: $e');
+    }
+  }
+
+  /// Получает сохраненный URL плейлиста
+  Future<String?> getSavedPlaylistUrl() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getString(_playlistUrlKey);
+    } catch (e) {
+      return null;
     }
   }
 }

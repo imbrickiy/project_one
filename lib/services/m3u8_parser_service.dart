@@ -1,8 +1,10 @@
 import 'dart:io';
 import 'dart:convert';
 import '../models/iptv_channel.dart';
+import 'playlist_storage_service.dart';
 
 class M3u8ParserService {
+  final PlaylistStorageService _storageService = PlaylistStorageService();
   Future<List<IptvChannel>> parseM3u8File(File file) async {
     try {
       final content = await file.readAsString();
@@ -103,6 +105,25 @@ class M3u8ParserService {
   }
 
   Future<List<IptvChannel>> parseM3u8FromUrl(String url) async {
+    // Сначала проверяем, есть ли сохраненный плейлист с таким URL
+    try {
+      final savedUrl = await _storageService.getSavedPlaylistUrl();
+      final hasSaved = await _storageService.hasSavedPlaylist();
+      
+      // Если URL совпадает и есть сохраненный плейлист - используем кэш
+      if (hasSaved && savedUrl == url) {
+        final cachedChannels = await _storageService.loadSavedPlaylist();
+        if (cachedChannels.isNotEmpty) {
+          // Возвращаем кэшированный плейлист
+          return cachedChannels;
+        }
+      }
+    } catch (e) {
+      // Если ошибка при проверке кэша - продолжаем загрузку из сети
+      print('Ошибка проверки кэша: $e');
+    }
+
+    // Если кэша нет или URL не совпадает - загружаем из сети
     final client = HttpClient();
     try {
       final request = await client.getUrl(Uri.parse(url));
@@ -116,6 +137,14 @@ class M3u8ParserService {
       final channels = await parseM3u8File(tempFile);
       
       await tempFile.delete();
+      
+      // Сохраняем плейлист в кэш с URL
+      try {
+        await _storageService.savePlaylist(channels, playlistUrl: url);
+      } catch (e) {
+        // Не прерываем работу, если сохранение не удалось
+        print('Ошибка сохранения плейлиста в кэш: $e');
+      }
       
       return channels;
     } catch (e) {

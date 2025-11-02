@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'dart:async';
+import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:file_picker/file_picker.dart';
@@ -10,6 +11,7 @@ import '../services/favorites_service.dart';
 import '../services/player_service.dart';
 import '../services/playlist_storage_service.dart';
 import '../widgets/channel_logo.dart';
+import 'settings_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -38,17 +40,23 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   String? _loadedFileName;
   bool _isDrawerOpen = false;
   bool _showDrawerButton = false;
+  bool _isMouseOverPlayer = false;
   late final ValueNotifier<bool> _drawerNotifier;
   Timer? _hideDrawerButtonTimer;
   Timer? _drawerStateCheckTimer;
   Timer? _filterDebounceTimer;
   OverlayEntry? _drawerButtonOverlay;
+  OverlayEntry? _successNotificationOverlay;
+  Timer? _successNotificationTimer;
   StreamSubscription<PlayerState>? _playerStateSubscription;
+  bool _overlayInitialized = false;
   // Кэш состояния избранного для оптимизации
   final Map<String, bool> _favoritesCache = {};
   bool _isFavoritesLoaded = false;
-  // Состояние раскрытых групп
-  final Map<String, bool> _expandedGroups = {};
+  // Состояние раскрытых групп - используем ValueNotifier для изоляции от setState
+  late final ValueNotifier<Map<String, bool>> _expandedGroupsNotifier;
+  // Флаг открытого экрана настроек
+  bool _isSettingsOpen = false;
 
   @override
   void initState() {
@@ -64,22 +72,71 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     _searchController.addListener(_onSearchChanged);
     _drawerNotifier = ValueNotifier<bool>(false);
     _drawerNotifier.addListener(_onDrawerStateChanged);
+    _expandedGroupsNotifier = ValueNotifier<Map<String, bool>>({});
     _startDrawerStateChecking();
-    // Сначала загружаем сохраненный плейлист, затем избранное
-    _loadSavedPlaylist().then((_) => _loadFavorites());
+    // Загружаем только избранное
+    _loadFavorites();
+    // Загружаем сохраненный плейлист из кэша
+    _loadSavedPlaylist();
     // Слушаем изменения состояния плеера для обновления overlay
     _playerStateSubscription = _playerService.playerStateStream.listen((state) {
       if (mounted && _drawerButtonOverlay != null) {
         _drawerButtonOverlay!.markNeedsBuild();
       }
-      // Показываем кнопку автоматически при паузе
-      if (!state.isPlaying && state.currentChannel != null && !_showDrawerButton) {
-        setState(() {
-          _showDrawerButton = true;
-        });
+      
+      final isVideoPlaying = state.isPlaying && state.currentChannel != null;
+      final hasError = state.errorMessage != null || _errorMessage != null;
+      
+      // Если есть ошибка - всегда показываем кнопку drawer
+      if (hasError) {
+        if (!_showDrawerButton) {
+          setState(() {
+            _showDrawerButton = true;
+          });
+        }
+        // Отменяем таймер скрытия при ошибке
         _hideDrawerButtonTimer?.cancel();
-        _hideDrawerButtonTimer = Timer(const Duration(seconds: 3), () {
-          if (mounted) {
+        _hideDrawerButtonTimer = null;
+        if (_drawerButtonOverlay != null) {
+          _drawerButtonOverlay!.markNeedsBuild();
+        }
+        return;
+      }
+      
+      // Если мышь над плеером - показываем кнопку
+      if (_isMouseOverPlayer && isVideoPlaying) {
+        if (!_showDrawerButton) {
+          setState(() {
+            _showDrawerButton = true;
+          });
+        }
+        // Отменяем таймер скрытия при наведении мыши
+        _hideDrawerButtonTimer?.cancel();
+        _hideDrawerButtonTimer = null;
+        if (_drawerButtonOverlay != null) {
+          _drawerButtonOverlay!.markNeedsBuild();
+        }
+        return;
+      }
+      
+      // Автоматически показываем кнопку когда видео не играет
+      if (!isVideoPlaying) {
+        if (!_showDrawerButton) {
+          setState(() {
+            _showDrawerButton = true;
+          });
+        }
+        // Отменяем таймер скрытия, если видео остановлено
+        _hideDrawerButtonTimer?.cancel();
+        _hideDrawerButtonTimer = null;
+        if (_drawerButtonOverlay != null) {
+          _drawerButtonOverlay!.markNeedsBuild();
+        }
+      } else {
+        // Когда видео играет и мышь не над плеером - скрываем кнопку после короткой задержки
+        _hideDrawerButtonTimer?.cancel();
+        _hideDrawerButtonTimer = Timer(const Duration(seconds: 2), () {
+          if (mounted && _showDrawerButton && !_isMouseOverPlayer) {
             setState(() {
               _showDrawerButton = false;
             });
@@ -88,27 +145,41 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
             }
           }
         });
-        if (_drawerButtonOverlay != null) {
-          _drawerButtonOverlay!.markNeedsBuild();
-        }
       }
     });
-    // Добавляем overlay для кнопки drawer после первого кадра
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _showDrawerButtonOverlay();
-    });
+    // Устанавливаем флаг показа кнопки по умолчанию (кнопка видна когда видео не играет)
+    _showDrawerButton = true;
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // Добавляем overlay для кнопки drawer после готовности контекста
+    if (!_overlayInitialized) {
+      _overlayInitialized = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _drawerButtonOverlay == null) {
+          _showDrawerButtonOverlay();
+        }
+      });
+    }
   }
 
   @override
   void dispose() {
     _hideDrawerButtonTimer?.cancel();
     _filterDebounceTimer?.cancel();
+    _successNotificationTimer?.cancel();
     _playerStateSubscription?.cancel();
-    _drawerNotifier.removeListener(_onDrawerStateChanged);
-    _drawerNotifier.dispose();
     _drawerStateCheckTimer?.cancel();
+    // Сначала удаляем overlay, чтобы ValueListenableBuilder не использовал disposed ValueNotifier
     _drawerButtonOverlay?.remove();
     _drawerButtonOverlay = null;
+    _hideSuccessNotification();
+    // Затем удаляем слушатели и dispose-им ValueNotifier
+    _drawerNotifier.removeListener(_onDrawerStateChanged);
+    _drawerNotifier.dispose();
+    _expandedGroupsNotifier.dispose();
     // Восстанавливаем системный UI при закрытии
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     SystemChrome.setPreferredOrientations([
@@ -125,61 +196,98 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   void _showDrawerButtonOverlay() {
     if (!mounted) return;
     
+    // Гарантируем, что кнопка должна быть видна при создании overlay
+    if (!_showDrawerButton) {
+      _showDrawerButton = true;
+    }
+    
     if (_drawerButtonOverlay != null) {
       _drawerButtonOverlay!.remove();
+      _drawerButtonOverlay = null;
     }
 
     final overlay = Overlay.of(context);
-    if (overlay == null) return;
+    if (overlay == null) {
+      // Если overlay еще не готов, попробуем создать его в следующем кадре
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          _showDrawerButtonOverlay();
+        }
+      });
+      return;
+    }
 
     _drawerButtonOverlay = OverlayEntry(
-      builder: (overlayContext) => StreamBuilder<PlayerState>(
-        stream: _playerService.playerStateStream,
-        initialData: PlayerState(
-          isInitialized: false,
-          isPlaying: false,
-        ),
-        builder: (context, snapshot) {
-          final state = snapshot.data!;
-          
-          // Показываем кнопку всегда, кроме случая когда видео активно воспроизводится
-          // или если временное отображение истекло и видео играет
-          final isVideoPlaying = state.isPlaying && state.currentChannel != null;
-          if (isVideoPlaying && !_showDrawerButton) {
-            return const SizedBox.shrink();
-          }
-
-          return ValueListenableBuilder<bool>(
-            valueListenable: _drawerNotifier,
-            builder: (context, isDrawerOpen, child) {
-              // Скрываем кнопку если drawer открыт
-              if (isDrawerOpen) {
-                return const SizedBox.shrink();
-              }
+      builder: (overlayContext) {
+        if (!mounted) {
+          return const SizedBox.shrink();
+        }
+        
+        return StreamBuilder<PlayerState>(
+          stream: _playerService.playerStateStream,
+          initialData: PlayerState(
+            isInitialized: false,
+            isPlaying: false,
+          ),
+          builder: (context, snapshot) {
+            if (!mounted) {
+              return const SizedBox.shrink();
+            }
+            
+            final state = snapshot.data!;
+            
+            // Проверяем наличие ошибок
+            final hasError = state.errorMessage != null || _errorMessage != null;
+            
+            // Проверяем, должно ли видео скрывать кнопку
+            final isVideoPlaying = state.isPlaying && state.currentChannel != null;
+            final shouldHideForVideo = isVideoPlaying && !_showDrawerButton && !hasError && !_isMouseOverPlayer;
+            
+            return ValueListenableBuilder<bool>(
+              valueListenable: _drawerNotifier,
+              builder: (context, isDrawerOpen, child) {
+                if (!mounted) {
+                  return const SizedBox.shrink();
+                }
+                
+                // Скрываем кнопку только в следующих случаях:
+                // 1. Видео играет И временный флаг не установлен И нет ошибок И мышь не над плеером
+                // 2. Drawer открыт
+                // 3. Экран настроек открыт
+                // При наличии ошибок или наведении мыши кнопка всегда видна
+                if ((shouldHideForVideo || isDrawerOpen || _isSettingsOpen) && !hasError && !_isMouseOverPlayer) {
+                  return const SizedBox.shrink();
+                }
               
-              return Positioned(
-                top: MediaQuery.of(overlayContext).padding.top + 8,
-                left: 8,
-                child: Material(
-                  elevation: 0,
-                  shadowColor: Colors.transparent,
-                  borderRadius: BorderRadius.circular(12),
-                  color: Colors.transparent,
-                  child: _DrawerButton(
-                    onTap: () {
-                      _scaffoldKey.currentState?.openDrawer();
-                    },
+                return Positioned(
+                  top: MediaQuery.of(overlayContext).padding.top + 8,
+                  left: 8,
+                  child: Material(
+                    elevation: 0,
+                    shadowColor: Colors.transparent,
+                    borderRadius: BorderRadius.circular(12),
+                    color: Colors.transparent,
+                    child: _DrawerButton(
+                      onTap: () {
+                        if (mounted) {
+                          _scaffoldKey.currentState?.openDrawer();
+                        }
+                      },
+                    ),
                   ),
-                ),
-              );
-            },
-          );
-        },
-      ),
+                );
+              },
+            );
+          },
+        );
+      },
       opaque: false,
     );
 
     overlay.insert(_drawerButtonOverlay!);
+    
+    // Принудительно обновляем overlay, чтобы кнопка появилась сразу
+    _drawerButtonOverlay!.markNeedsBuild();
   }
 
   void _showDrawerButtonTemporarily() {
@@ -277,15 +385,17 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         setState(() {
           _favoriteChannels = favorites;
           _filteredFavoriteChannels = favorites;
-          // Показываем кнопку drawer при запуске, если есть каналы
-          if (favorites.isNotEmpty || _loadedChannels.isNotEmpty) {
-            _showDrawerButton = true;
-          }
+          // Кнопка drawer должна быть видна всегда
+          _showDrawerButton = true;
         });
         _filterChannels();
         // Обновляем overlay после загрузки
         WidgetsBinding.instance.addPostFrameCallback((_) {
-          _showDrawerButtonOverlay();
+          if (mounted && _drawerButtonOverlay == null) {
+            _showDrawerButtonOverlay();
+          } else if (mounted && _drawerButtonOverlay != null) {
+            _drawerButtonOverlay!.markNeedsBuild();
+          }
         });
       }
     }).catchError((error) {
@@ -370,6 +480,17 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         if (channels.isEmpty) {
           setState(() {
             _errorMessage = 'В файле не найдено каналов';
+            _showDrawerButton = true; // Показываем кнопку drawer при ошибке
+          });
+          if (_drawerButtonOverlay != null) {
+            _drawerButtonOverlay!.markNeedsBuild();
+          }
+        } else if (mounted) {
+          // Показываем pop-up уведомление об успешной загрузке
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) {
+              _showSuccessNotification(channels.length);
+            }
           });
         }
       } else {
@@ -381,7 +502,11 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       setState(() {
         _isLoading = false;
         _errorMessage = 'Ошибка: ${e.toString()}';
+        _showDrawerButton = true; // Показываем кнопку drawer при ошибке
       });
+      if (_drawerButtonOverlay != null) {
+        _drawerButtonOverlay!.markNeedsBuild();
+      }
     }
   }
 
@@ -429,7 +554,11 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       if (mounted) {
         setState(() {
           _errorMessage = 'Ошибка воспроизведения: ${error.toString()}';
+          _showDrawerButton = true; // Показываем кнопку drawer при ошибке
         });
+        if (_drawerButtonOverlay != null) {
+          _drawerButtonOverlay!.markNeedsBuild();
+        }
       }
     });
   }
@@ -438,18 +567,19 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     // Используем кэш вместо FutureBuilder для избежания блокировки
     final isFavorite = _favoritesCache[channel.url] ?? false;
     
-    // Если кэш не загружен, загружаем асинхронно
+    // Если кэш не загружен, загружаем асинхронно без setState
     if (!_isFavoritesLoaded && !_favoritesCache.containsKey(channel.url)) {
       _favoritesService.isFavorite(channel).then((value) {
         if (mounted) {
-          setState(() {
-            _favoritesCache[channel.url] = value;
-          });
+          // Обновляем кэш без setState, чтобы не перестраивать весь список
+          _favoritesCache[channel.url] = value;
         }
       });
     }
     
-    return Container(
+    return RepaintBoundary(
+      key: ValueKey(channel.url), // Уникальный ключ для каждого элемента
+      child: Container(
           margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
           decoration: BoxDecoration(
             color: isSelected ? Colors.grey[700] : Colors.grey[800],
@@ -502,7 +632,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
             ),
             onTap: () => _selectChannel(channel),
           ),
-        );
+        ),
+    );
   }
 
 
@@ -592,8 +723,11 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
               groupedChannels[groupKey] = [];
               // По умолчанию все группы раскрыты
               final expandedKey = '$tabPrefix$groupKey';
-              if (!_expandedGroups.containsKey(expandedKey)) {
-                _expandedGroups[expandedKey] = true;
+              if (!_expandedGroupsNotifier.value.containsKey(expandedKey)) {
+                _expandedGroupsNotifier.value = {
+                  ..._expandedGroupsNotifier.value,
+                  expandedKey: true,
+                };
               }
             }
             groupedChannels[groupKey]!.add(channel);
@@ -610,6 +744,9 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         if (!hasGroups && ungroupedChannels.isNotEmpty) {
           return ListView.builder(
             padding: const EdgeInsets.symmetric(vertical: 8),
+            cacheExtent: 500, // Увеличиваем кэш для плавной прокрутки
+            addAutomaticKeepAlives: true, // Сохраняем состояние элементов
+            addRepaintBoundaries: true, // Изолируем перерисовки
             itemCount: ungroupedChannels.length,
             itemBuilder: (context, index) {
               final channel = ungroupedChannels[index];
@@ -621,141 +758,198 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         
         // Инициализируем состояние для группы "Без группы"
         final ungroupedKey = '${tabPrefix}ungrouped';
-        if (ungroupedChannels.isNotEmpty && !_expandedGroups.containsKey(ungroupedKey)) {
-          _expandedGroups[ungroupedKey] = true;
+        if (ungroupedChannels.isNotEmpty && !_expandedGroupsNotifier.value.containsKey(ungroupedKey)) {
+          _expandedGroupsNotifier.value = {
+            ..._expandedGroupsNotifier.value,
+            ungroupedKey: true,
+          };
         }
         
-        // Создаем список виджетов для групп
-        return ListView.builder(
-          padding: const EdgeInsets.symmetric(vertical: 8),
-          itemCount: sortedGroups.length + (ungroupedChannels.isNotEmpty ? 1 : 0),
-          itemBuilder: (context, index) {
-            // Обрабатываем группы с каналами
-            if (index < sortedGroups.length) {
-              final groupName = sortedGroups[index];
-              final groupChannels = groupedChannels[groupName]!;
-              final expandedKey = '$tabPrefix$groupName';
-              
-              return ExpansionTile(
-                key: ValueKey('${tabPrefix}group_$groupName'),
-                initiallyExpanded: _expandedGroups[expandedKey] ?? true,
-                onExpansionChanged: (expanded) {
-                  setState(() {
-                    _expandedGroups[expandedKey] = expanded;
-                  });
-                },
-                title: Row(
-                  children: [
-                    Icon(
-                      Icons.folder,
-                      color: Colors.grey[400],
-                      size: 20,
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        groupName,
-                        style: TextStyle(
-                          color: Colors.grey[300],
-                          fontSize: 14,
-                          fontWeight: FontWeight.w600,
+        // Создаем список виджетов для групп - используем ValueListenableBuilder для изоляции перестроек
+        return ValueListenableBuilder<Map<String, bool>>(
+          valueListenable: _expandedGroupsNotifier,
+          builder: (context, expandedGroups, child) {
+            return ListView.builder(
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              cacheExtent: 500, // Увеличиваем кэш для плавной прокрутки
+              addAutomaticKeepAlives: true, // Сохраняем состояние элементов
+              addRepaintBoundaries: true, // Изолируем перерисовки
+              itemCount: sortedGroups.length + (ungroupedChannels.isNotEmpty ? 1 : 0),
+              itemBuilder: (context, index) {
+                // Обрабатываем группы с каналами
+                if (index < sortedGroups.length) {
+                  final groupName = sortedGroups[index];
+                  final groupChannels = groupedChannels[groupName]!;
+                  final expandedKey = '$tabPrefix$groupName';
+                  
+                  return ExpansionTile(
+                    key: ValueKey('${tabPrefix}group_$groupName'),
+                    initiallyExpanded: expandedGroups[expandedKey] ?? true,
+                    maintainState: false,
+                    onExpansionChanged: (expanded) {
+                      // Обновляем состояние через ValueNotifier без setState
+                      _expandedGroupsNotifier.value = {
+                        ..._expandedGroupsNotifier.value,
+                        expandedKey: expanded,
+                      };
+                    },
+                    title: Row(
+                      children: [
+                        Icon(
+                          Icons.folder,
+                          color: Colors.grey[400],
+                          size: 20,
                         ),
-                      ),
-                    ),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 4,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Colors.grey[700],
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: Text(
-                        '${groupChannels.length}',
-                        style: TextStyle(
-                          color: Colors.grey[300],
-                          fontSize: 12,
-                          fontWeight: FontWeight.w500,
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            groupName,
+                            style: TextStyle(
+                              color: Colors.grey[300],
+                              fontSize: 14,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
                         ),
-                      ),
-                    ),
-                  ],
-                ),
-                iconColor: Colors.grey[400],
-                collapsedIconColor: Colors.grey[500],
-                backgroundColor: Colors.grey[850],
-                collapsedBackgroundColor: Colors.grey[850],
-                childrenPadding: const EdgeInsets.only(left: 16),
-                children: groupChannels.map((channel) {
-                  final isSelected = currentChannel?.url == channel.url;
-                  return _buildChannelItem(channel, isSelected);
-                }).toList(),
-              );
-            }
-            
-            // Обрабатываем каналы без группы
-            if (ungroupedChannels.isNotEmpty) {
-              final ungroupedKey = '${tabPrefix}ungrouped';
-              return ExpansionTile(
-                key: ValueKey('${tabPrefix}ungrouped'),
-                initiallyExpanded: _expandedGroups[ungroupedKey] ?? true,
-                onExpansionChanged: (expanded) {
-                  setState(() {
-                    _expandedGroups[ungroupedKey] = expanded;
-                  });
-                },
-                title: Row(
-                  children: [
-                    Icon(
-                      Icons.folder_outlined,
-                      color: Colors.grey[400],
-                      size: 20,
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        'Без группы',
-                        style: TextStyle(
-                          color: Colors.grey[300],
-                          fontSize: 14,
-                          fontWeight: FontWeight.w600,
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 4,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.grey[700],
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Text(
+                            '${groupChannels.length}',
+                            style: TextStyle(
+                              color: Colors.grey[300],
+                              fontSize: 12,
+                              fontWeight: FontWeight.w500,
+                            ),
+                          ),
                         ),
-                      ),
+                      ],
                     ),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 4,
-                      ),
-                      decoration: BoxDecoration(
-                        color: Colors.grey[700],
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: Text(
-                        '${ungroupedChannels.length}',
-                        style: TextStyle(
-                          color: Colors.grey[300],
-                          fontSize: 12,
-                          fontWeight: FontWeight.w500,
+                    iconColor: Colors.grey[400],
+                    collapsedIconColor: Colors.grey[500],
+                    backgroundColor: Colors.grey[850],
+                    collapsedBackgroundColor: Colors.grey[850],
+                    childrenPadding: const EdgeInsets.only(left: 16),
+                    children: [
+                      // Используем ListView.builder внутри для виртуализации больших групп
+                      if (groupChannels.length > 50)
+                        SizedBox(
+                          height: (groupChannels.length * 64.0).clamp(0.0, 2000.0), // Ограничиваем высоту
+                          child: ListView.builder(
+                            shrinkWrap: true,
+                            physics: const NeverScrollableScrollPhysics(),
+                            cacheExtent: 200,
+                            addRepaintBoundaries: true,
+                            itemCount: groupChannels.length,
+                            itemBuilder: (context, idx) {
+                              final channel = groupChannels[idx];
+                              final isSelected = currentChannel?.url == channel.url;
+                              return _buildChannelItem(channel, isSelected);
+                            },
+                          ),
+                        )
+                      else
+                        ...groupChannels.map((channel) {
+                          final isSelected = currentChannel?.url == channel.url;
+                          return _buildChannelItem(channel, isSelected);
+                        }).toList(),
+                    ],
+                  );
+                }
+                
+                // Обрабатываем каналы без группы
+                if (ungroupedChannels.isNotEmpty) {
+                  final ungroupedKey = '${tabPrefix}ungrouped';
+                  return ExpansionTile(
+                    key: ValueKey('${tabPrefix}ungrouped'),
+                    initiallyExpanded: expandedGroups[ungroupedKey] ?? true,
+                    maintainState: false,
+                    onExpansionChanged: (expanded) {
+                      // Обновляем состояние через ValueNotifier без setState
+                      _expandedGroupsNotifier.value = {
+                        ..._expandedGroupsNotifier.value,
+                        ungroupedKey: expanded,
+                      };
+                    },
+                    title: Row(
+                      children: [
+                        Icon(
+                          Icons.folder_outlined,
+                          color: Colors.grey[400],
+                          size: 20,
                         ),
-                      ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            'Без группы',
+                            style: TextStyle(
+                              color: Colors.grey[300],
+                              fontSize: 14,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 4,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.grey[700],
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Text(
+                            '${ungroupedChannels.length}',
+                            style: TextStyle(
+                              color: Colors.grey[300],
+                              fontSize: 12,
+                              fontWeight: FontWeight.w500,
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
-                  ],
-                ),
-                iconColor: Colors.grey[400],
-                collapsedIconColor: Colors.grey[500],
-                backgroundColor: Colors.grey[850],
-                collapsedBackgroundColor: Colors.grey[850],
-                childrenPadding: const EdgeInsets.only(left: 16),
-                children: ungroupedChannels.map((channel) {
-                  final isSelected = currentChannel?.url == channel.url;
-                  return _buildChannelItem(channel, isSelected);
-                }).toList(),
-              );
-            }
-            
-            return const SizedBox.shrink();
+                    iconColor: Colors.grey[400],
+                    collapsedIconColor: Colors.grey[500],
+                    backgroundColor: Colors.grey[850],
+                    collapsedBackgroundColor: Colors.grey[850],
+                    childrenPadding: const EdgeInsets.only(left: 16),
+                    children: [
+                      // Используем ListView.builder внутри для виртуализации больших групп
+                      if (ungroupedChannels.length > 50)
+                        SizedBox(
+                          height: (ungroupedChannels.length * 64.0).clamp(0.0, 2000.0), // Ограничиваем высоту
+                          child: ListView.builder(
+                            shrinkWrap: true,
+                            physics: const NeverScrollableScrollPhysics(),
+                            cacheExtent: 200,
+                            addRepaintBoundaries: true,
+                            itemCount: ungroupedChannels.length,
+                            itemBuilder: (context, idx) {
+                              final channel = ungroupedChannels[idx];
+                              final isSelected = currentChannel?.url == channel.url;
+                              return _buildChannelItem(channel, isSelected);
+                            },
+                          ),
+                        )
+                      else
+                        ...ungroupedChannels.map((channel) {
+                          final isSelected = currentChannel?.url == channel.url;
+                          return _buildChannelItem(channel, isSelected);
+                        }).toList(),
+                    ],
+                  );
+                }
+                
+                return const SizedBox.shrink();
+              },
+            );
           },
         );
       },
@@ -764,110 +958,162 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
 
 
   Widget _buildVideoPlayer() {
-    return StreamBuilder<PlayerState>(
-      stream: _playerService.playerStateStream,
-      initialData: PlayerState(
-        isInitialized: false,
-        isPlaying: false,
-      ),
-      builder: (context, snapshot) {
-        final state = snapshot.data!;
-        final videoController = _playerService.videoController;
-        final currentChannel = state.currentChannel;
-
-
-        // Показываем loader только если есть текущий канал, но плеер не инициализирован
-        if (currentChannel != null && (!state.isInitialized || videoController == null)) {
-          return Container(
-            color: Colors.black,
-            child: const Center(
-              child: CircularProgressIndicator(
-                valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-              ),
-            ),
-          );
+    return MouseRegion(
+      onEnter: (_) {
+        if (mounted) {
+          setState(() {
+            _isMouseOverPlayer = true;
+          });
+          // Показываем кнопку drawer при наведении
+          if (!_showDrawerButton) {
+            setState(() {
+              _showDrawerButton = true;
+            });
+          }
+          // Отменяем таймер скрытия
+          _hideDrawerButtonTimer?.cancel();
+          _hideDrawerButtonTimer = null;
+          // Обновляем overlay
+          if (_drawerButtonOverlay != null) {
+            _drawerButtonOverlay!.markNeedsBuild();
+          }
         }
+      },
+      onExit: (_) {
+        if (mounted) {
+          setState(() {
+            _isMouseOverPlayer = false;
+          });
+          // Обновляем overlay
+          if (_drawerButtonOverlay != null) {
+            _drawerButtonOverlay!.markNeedsBuild();
+          }
+          // Если видео играет и нет ошибок - скрываем кнопку через задержку
+          final hasError = _playerService.errorMessage != null || _errorMessage != null;
+          final isVideoPlaying = _playerService.isPlaying && _playerService.currentChannel != null;
+          
+          if (isVideoPlaying && !hasError) {
+            _hideDrawerButtonTimer?.cancel();
+            _hideDrawerButtonTimer = Timer(const Duration(seconds: 2), () {
+              if (mounted && !_isMouseOverPlayer && _showDrawerButton) {
+                setState(() {
+                  _showDrawerButton = false;
+                });
+                if (_drawerButtonOverlay != null) {
+                  _drawerButtonOverlay!.markNeedsBuild();
+                }
+              }
+            });
+          }
+        }
+      },
+      child: StreamBuilder<PlayerState>(
+        stream: _playerService.playerStateStream,
+        initialData: PlayerState(
+          isInitialized: false,
+          isPlaying: false,
+        ),
+        builder: (context, snapshot) {
+          final state = snapshot.data!;
+          final videoController = _playerService.videoController;
+          final currentChannel = state.currentChannel;
 
-        if (state.errorMessage != null && currentChannel != null) {
-          return Container(
-            color: Colors.black,
-            child: Center(
-              child: Padding(
-                padding: const EdgeInsets.all(24.0),
+
+          // Показываем loader только если есть текущий канал, но плеер не инициализирован
+          if (currentChannel != null && (!state.isInitialized || videoController == null)) {
+            return Container(
+              color: Colors.black,
+              child: const Center(
+                child: CircularProgressIndicator(
+                  valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                ),
+              ),
+            );
+          }
+
+          if (state.errorMessage != null && currentChannel != null) {
+            return Container(
+              color: Colors.black,
+              child: Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(24.0),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(
+                        Icons.error_outline,
+                        size: 64,
+                        color: Colors.red[400],
+                      ),
+                      const SizedBox(height: 16),
+                      Text(
+                        state.errorMessage!,
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: Colors.red[300],
+                          fontSize: 14,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          }
+
+          if (currentChannel == null) {
+            return Container(
+              color: Colors.black,
+              child: Center(
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
                     Icon(
-                      Icons.error_outline,
-                      size: 64,
-                      color: Colors.red[400],
+                      Icons.play_circle_outline,
+                      size: 80,
+                      color: Colors.grey[600],
                     ),
                     const SizedBox(height: 16),
                     Text(
-                      state.errorMessage!,
-                      textAlign: TextAlign.center,
+                      'Выберите канал для воспроизведения',
                       style: TextStyle(
-                        color: Colors.red[300],
-                        fontSize: 14,
+                        color: Colors.grey[500],
+                        fontSize: 16,
                       ),
                     ),
                   ],
                 ),
               ),
-            ),
-          );
-        }
+            );
+          }
 
-        if (currentChannel == null) {
-          return Container(
-            color: Colors.black,
-            child: Center(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Icon(
-                    Icons.play_circle_outline,
-                    size: 80,
-                    color: Colors.grey[600],
-                  ),
-                  const SizedBox(height: 16),
-                  Text(
-                    'Выберите канал для воспроизведения',
-                    style: TextStyle(
-                      color: Colors.grey[500],
-                      fontSize: 16,
-                    ),
-                  ),
-                ],
+          // Проверяем что videoController не null перед использованием
+          if (videoController == null) {
+            return Container(
+              color: Colors.black,
+              child: const Center(
+                child: CircularProgressIndicator(
+                  valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                ),
+              ),
+            );
+          }
+
+          // Только Video виджет с родными контролами, без кастомных оверлеев
+          // RepaintBoundary оптимизирует перерисовки при движении ползунка
+          // Key предотвращает перестройку при изменениях состояния других виджетов
+          return RepaintBoundary(
+            key: const ValueKey('video_player'),
+            child: GestureDetector(
+              onDoubleTap: _handleDoubleTap,
+              child: Video(
+                controller: videoController!,
+                fill: Colors.black,
               ),
             ),
           );
-        }
-
-        // Проверяем что videoController не null перед использованием
-        if (videoController == null) {
-          return Container(
-            color: Colors.black,
-            child: const Center(
-              child: CircularProgressIndicator(
-                valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-              ),
-            ),
-          );
-        }
-
-        // Только Video виджет с родными контролами, без кастомных оверлеев
-        // RepaintBoundary оптимизирует перерисовки при движении ползунка
-        return RepaintBoundary(
-          child: GestureDetector(
-            onDoubleTap: _handleDoubleTap,
-            child: Video(
-              controller: videoController!,
-              fill: Colors.black,
-            ),
-          ),
-        );
-      },
+        },
+      ),
     );
   }
 
@@ -914,69 +1160,165 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     }
   }
 
-  Future<void> _deletePlaylistFromStorage() async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: Colors.grey[900],
-        title: const Text(
-          'Удалить сохраненный плейлист?',
-          style: TextStyle(color: Colors.white),
-        ),
-        content: const Text(
-          'Это действие удалит сохраненный плейлист из памяти устройства. Продолжить?',
-          style: TextStyle(color: Colors.grey),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(false),
-            child: const Text('Отмена', style: TextStyle(color: Colors.grey)),
+  void _showSuccessNotification(int channelCount) {
+    if (!mounted) return;
+    
+    // Закрываем предыдущее уведомление, если оно есть
+    _hideSuccessNotification();
+    
+    // Создаем overlay entry для уведомления
+    _successNotificationOverlay = OverlayEntry(
+      builder: (context) => Positioned(
+        top: 50,
+        left: 16,
+        right: 16,
+        child: Material(
+          color: Colors.transparent,
+          child: TweenAnimationBuilder<double>(
+            duration: const Duration(milliseconds: 300),
+            tween: Tween(begin: 0.0, end: 1.0),
+            builder: (context, value, child) {
+              return Opacity(
+                opacity: value,
+                child: Transform.translate(
+                  offset: Offset(0, 20 * (1 - value)),
+                  child: child,
+                ),
+              );
+            },
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              decoration: BoxDecoration(
+                color: Colors.green[700],
+                borderRadius: BorderRadius.circular(12),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.3),
+                    blurRadius: 8,
+                    offset: const Offset(0, 2),
+                  ),
+                ],
+              ),
+              child: Row(
+                children: [
+                  const Icon(
+                    Icons.check_circle,
+                    color: Colors.white,
+                    size: 24,
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      'Плейлист загружен успешно\n$channelCount ${_getChannelWord(channelCount)}',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 14,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
           ),
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(true),
-            child: const Text('Удалить', style: TextStyle(color: Colors.red)),
-          ),
-        ],
+        ),
       ),
     );
-
-    if (confirmed == true && mounted) {
-      try {
-        await _playlistStorageService.deleteSavedPlaylist();
-        setState(() {
-          _loadedChannels = [];
-          _filteredLoadedChannels = [];
-          _loadedFileName = null;
-        });
-        _filterChannels();
+    
+    // Добавляем overlay в контекст
+    final overlay = Overlay.of(context);
+    if (overlay != null) {
+      overlay.insert(_successNotificationOverlay!);
+      
+      // Убираем уведомление через 5 секунд
+      _successNotificationTimer = Timer(const Duration(seconds: 5), () {
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: const Text('Плейлист удален из памяти'),
-              backgroundColor: Colors.green[700],
-              duration: const Duration(seconds: 2),
-            ),
-          );
-          Navigator.of(context).pop(); // Закрываем drawer
-          // Пересоздаем overlay после закрытия drawer
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (mounted) {
-              _showDrawerButtonOverlay();
-            }
-          });
+          _hideSuccessNotification();
         }
-      } catch (e) {
-        if (mounted) {
+      });
+    }
+  }
+  
+  String _getChannelWord(int count) {
+    final lastDigit = count % 10;
+    final lastTwoDigits = count % 100;
+    
+    if (lastTwoDigits >= 11 && lastTwoDigits <= 14) {
+      return 'каналов';
+    }
+    
+    if (lastDigit == 1) {
+      return 'канал';
+    } else if (lastDigit >= 2 && lastDigit <= 4) {
+      return 'канала';
+    } else {
+      return 'каналов';
+    }
+  }
+  
+  void _hideSuccessNotification() {
+    if (_successNotificationOverlay != null) {
+      _successNotificationOverlay!.remove();
+      _successNotificationOverlay = null;
+    }
+    if (_successNotificationTimer != null) {
+      _successNotificationTimer!.cancel();
+      _successNotificationTimer = null;
+    }
+  }
+
+  void _openSettings(BuildContext context) {
+    Navigator.of(context).pop(); // Закрываем drawer
+    // Открываем экран настроек с именем маршрута для отслеживания
+    setState(() {
+      _isSettingsOpen = true;
+    });
+    // Обновляем overlay сразу, чтобы скрыть кнопку
+    if (_drawerButtonOverlay != null) {
+      _drawerButtonOverlay!.markNeedsBuild();
+    }
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        settings: const RouteSettings(name: '/settings'),
+        builder: (context) => const SettingsScreen(),
+      ),
+    ).then((result) {
+      // Обновляем флаг и overlay после закрытия настроек
+      if (mounted) {
+        setState(() {
+          _isSettingsOpen = false;
+        });
+        
+        // Если плейлист был удален - очищаем drawer
+        if (result == true) {
+          setState(() {
+            _loadedChannels = [];
+            _filteredLoadedChannels = [];
+            _loadedFileName = null;
+          });
+          _filterChannels();
+          
+          // Показываем уведомление об удалении плейлиста
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text('Ошибка удаления: ${e.toString()}'),
-              backgroundColor: Colors.red[700],
-              duration: const Duration(seconds: 3),
+            const SnackBar(
+              content: Text('Плейлист удален'),
+              backgroundColor: Colors.green,
+              duration: Duration(seconds: 2),
             ),
           );
+        }
+        
+        if (_drawerButtonOverlay != null) {
+          _drawerButtonOverlay!.markNeedsBuild();
         }
       }
-    }
+    });
+    // Пересоздаем overlay после закрытия drawer
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _showDrawerButtonOverlay();
+      }
+    });
   }
 
   void _startDrawerStateChecking() {
@@ -1147,35 +1489,6 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  if (_loadedFileName != null)
-                    Container(
-                      margin: const EdgeInsets.only(bottom: 12),
-                      padding: const EdgeInsets.all(10),
-                      decoration: BoxDecoration(
-                        color: Colors.grey[700],
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: Row(
-                        children: [
-                          Icon(
-                            Icons.check_circle,
-                            color: Colors.green[400],
-                            size: 18,
-                          ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: Text(
-                              _loadedFileName!,
-                              style: TextStyle(
-                                color: Colors.grey[300],
-                                fontSize: 11,
-                              ),
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
                   SizedBox(
                     width: double.infinity,
                     child: ElevatedButton.icon(
@@ -1207,57 +1520,29 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                       ),
                     ),
                   ),
-                  if (_loadedChannels.isNotEmpty)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 8),
-                      child: Row(
-                        children: [
-                          Expanded(
-                            child: OutlinedButton.icon(
-                              onPressed: _clearPlaylist,
-                              icon: const Icon(Icons.clear_all, size: 18),
-                              label: const Text(
-                                'Очистить',
-                                style: TextStyle(fontSize: 12),
-                              ),
-                              style: OutlinedButton.styleFrom(
-                                foregroundColor: Colors.orange[400],
-                                side: BorderSide(color: Colors.orange[400]!),
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 12,
-                                  vertical: 10,
-                                ),
-                                shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(8),
-                                ),
-                              ),
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: OutlinedButton.icon(
-                              onPressed: _deletePlaylistFromStorage,
-                              icon: const Icon(Icons.delete_outline, size: 18),
-                              label: const Text(
-                                'Удалить',
-                                style: TextStyle(fontSize: 12),
-                              ),
-                              style: OutlinedButton.styleFrom(
-                                foregroundColor: Colors.red[400],
-                                side: BorderSide(color: Colors.red[400]!),
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 12,
-                                  vertical: 10,
-                                ),
-                                shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(8),
-                                ),
-                              ),
-                            ),
-                          ),
-                        ],
+                  const SizedBox(height: 8),
+                  SizedBox(
+                    width: double.infinity,
+                    child: OutlinedButton.icon(
+                      onPressed: () => _openSettings(context),
+                      icon: const Icon(Icons.settings, size: 20),
+                      label: const Text(
+                        'Настройки',
+                        style: TextStyle(fontSize: 14),
+                      ),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.grey[300],
+                        side: BorderSide(color: Colors.grey[600]!),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 12,
+                        ),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(8),
+                        ),
                       ),
                     ),
+                  ),
                 ],
               ),
             ),
@@ -1269,6 +1554,16 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
 
   @override
   Widget build(BuildContext context) {
+    // Гарантируем создание overlay при первом build
+    if (!_overlayInitialized && _drawerButtonOverlay == null) {
+      _overlayInitialized = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _drawerButtonOverlay == null) {
+          _showDrawerButtonOverlay();
+        }
+      });
+    }
+    
     return Scaffold(
       key: _scaffoldKey,
       backgroundColor: Colors.black,
@@ -1315,6 +1610,10 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                             setState(() {
                               _errorMessage = null;
                             });
+                            // Обновляем overlay после закрытия ошибки
+                            if (_drawerButtonOverlay != null) {
+                              _drawerButtonOverlay!.markNeedsBuild();
+                            }
                           },
                         ),
                       ],
